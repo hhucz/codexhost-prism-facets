@@ -100,12 +100,26 @@ async function rpc(method, params) {
 
 // Shared per document: the new-session panel, page and widget reuse answers.
 const memo = new Map();
+const PENDING_REUSE_MS = 15_000;
 function cached(key, ttlMs, load, refresh) {
   const hit = memo.get(key);
-  if (!refresh && hit && Date.now() - hit.at < ttlMs) return hit.promise;
+  const reusable = hit && (hit.pending ? Date.now() - hit.at < PENDING_REUSE_MS : !refresh && Date.now() - hit.at < ttlMs);
+  if (reusable) return hit.promise;
+  const entry = { at: Date.now(), pending: true, promise: null };
   const promise = load();
-  memo.set(key, { at: Date.now(), promise });
-  promise.catch(() => memo.delete(key));
+  entry.promise = promise;
+  memo.set(key, entry);
+  promise.then(
+    () => {
+      if (memo.get(key) === entry) {
+        entry.at = Date.now();
+        entry.pending = false;
+      }
+    },
+    () => {
+      if (memo.get(key) === entry) memo.delete(key);
+    },
+  );
   return promise;
 }
 
@@ -131,7 +145,7 @@ async function codexhostQuota(refresh) {
       windows,
     });
   }
-  return { accounts: list.length, limits: out };
+  return { kind: "accounts", accounts: list.length, limits: out };
 }
 
 export function codexhostSource() {
@@ -151,17 +165,19 @@ export function codexhostSource() {
       const params = { range, ...(timeZone ? { timeZone } : {}), ...filters };
       const key = (p) => `stats:${JSON.stringify(p)}`;
       const allParams = { ...params, range: "all" };
-      const [main, all, quota] = await Promise.all([
+      const [main, all] = await Promise.all([
         cached(key(params), 15_000, () => rpc("codexhost/usage/statistics/get", params), refresh),
         range === "all" ? null : cached(key(allParams), 60_000, () => rpc("codexhost/usage/statistics/get", allParams), refresh),
-        codexhostQuota(refresh).catch(() => ({ accounts: 0, limits: [], error: true })),
       ]);
-      return normalizeCodexhost(main, all ?? main, quota);
+      return normalizeCodexhost(main, all ?? main);
+    },
+    loadQuota({ refresh } = {}) {
+      return codexhostQuota(refresh);
     },
   };
 }
 
-function normalizeCodexhost(main, all, quota) {
+function normalizeCodexhost(main, all) {
   const labels = new Map((main.modelLabels ?? []).map((m) => [m.model, m.label]));
   const modelLabel = (m) => (m === null ? null : labels.get(m) ?? m);
   const t = main.totals;
@@ -196,7 +212,6 @@ function normalizeCodexhost(main, all, quota) {
       .map((h) => ({ id: h.harness, label: harnessLabel(h.harness), tokens: tokensOf(h), requests: h.requests, cacheRate: hitRate(h), cost: h.costUsd }))
       .sort((a, b) => b.tokens - a.tokens)
       .map((h) => ({ ...h, share: tokens ? h.tokens / tokens : 0 })),
-    quota: { kind: "accounts", accounts: quota.accounts, limits: quota.limits, error: Boolean(quota.error) },
   };
 }
 
@@ -271,6 +286,9 @@ export function autoSource(api, { web }) {
         }
       }
       return logs.load(query);
+    },
+    loadQuota(query) {
+      return useLogs ? null : host.loadQuota(query);
     },
   };
 }

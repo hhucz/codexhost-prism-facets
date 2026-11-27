@@ -10,6 +10,12 @@ import { ALL, NO_PROJECT, autoSource } from "./usage-sources.mjs";
 const POLL_MS = 1500;
 const MAX_POLLS = 40;
 
+// Remounts (especially the CH Web home panel) reuse the last matching model
+// while its source refreshes in the background. Quota is account-wide, not
+// filter-specific, so it has one cache entry per host/source.
+const dataCache = new Map();
+const quotaCache = new Map();
+
 export function formatCompact(n) {
   if (n === null || n === undefined || !Number.isFinite(n)) return "—";
   const abs = Math.abs(n);
@@ -60,13 +66,21 @@ function windowLabel(w, t) {
  */
 export function mountUsageView(container, api, getT, opts = {}) {
   const source = opts.source ?? autoSource(api, { web: api.hostTarget === "web" });
+  const cacheScope = opts.source ? source.id : api.hostTarget;
   let tab = "overview";
   let range = "30d";
   let harness = ALL;
   let project = ALL;
-  let data = null;
+  const query = (refresh = false) => ({ range, harness, project, refresh });
+  const queryKey = (q) => JSON.stringify([cacheScope, q.range, q.harness, q.project]);
+  let activeKey = queryKey(query());
+  let data = dataCache.get(activeKey) ?? null;
   let error = null;
   let loading = false;
+  let quotaData = quotaCache.get(cacheScope) ?? data?.quota ?? null;
+  let quotaError = null;
+  let quotaLoading = false;
+  let quotaRequestId = 0;
   let timer = 0;
   let polls = 0;
   let disposed = false;
@@ -76,17 +90,40 @@ export function mountUsageView(container, api, getT, opts = {}) {
   async function load(refresh = false, poll = false) {
     clearTimeout(timer);
     if (!poll) polls = 0;
+    const q = query(refresh);
+    const key = queryKey(q);
+    if (key !== activeKey) {
+      data = null;
+      error = null;
+    }
+    activeKey = key;
+    data = dataCache.get(key) ?? data;
     const id = ++requestId;
     loading = true;
     render();
     try {
-      const result = await source.load({ range, harness, project, refresh });
+      const result = await source.load(q);
       if (disposed || id !== requestId) return;
       data = result;
+      dataCache.set(key, result);
       error = null;
+      if (result.source === "logs") {
+        // A Host quota request still in flight belongs to the old source.
+        quotaRequestId += 1;
+        quotaLoading = false;
+        quotaData = result.quota ?? null;
+        if (result.quota) quotaCache.set(cacheScope, result.quota);
+        else quotaCache.delete(cacheScope);
+        quotaError = null;
+      }
     } catch (e) {
       if (disposed || id !== requestId) return;
       error = e;
+      if (source.id === "logs") {
+        quotaRequestId += 1;
+        quotaLoading = false;
+        quotaError = e;
+      }
     }
     loading = false;
     render();
@@ -95,6 +132,36 @@ export function mountUsageView(container, api, getT, opts = {}) {
       polls += 1;
       timer = setTimeout(() => load(true, true), POLL_MS);
     }
+  }
+
+  async function loadQuota(refresh = false) {
+    // Desktop's log summary already includes quota. Reuse it instead of
+    // starting another scan; the normal statistics load will update it.
+    if (source.id === "logs" || !source.loadQuota) {
+      quotaRequestId += 1;
+      quotaData = data?.quota ?? quotaCache.get(cacheScope) ?? null;
+      if (error) quotaError = error;
+      quotaLoading = false;
+      render();
+      return;
+    }
+    const id = ++quotaRequestId;
+    quotaLoading = true;
+    render();
+    try {
+      const result = await source.loadQuota(query(refresh));
+      if (disposed || id !== quotaRequestId) return;
+      if (result?.kind === "accounts" && source.id === "logs") return;
+      quotaData = result;
+      if (result) quotaCache.set(cacheScope, result);
+      else quotaCache.delete(cacheScope);
+      quotaError = null;
+    } catch (e) {
+      if (disposed || id !== quotaRequestId) return;
+      quotaError = e;
+    }
+    quotaLoading = false;
+    render();
   }
 
   // ---- toolbar ---------------------------------------------------------------
@@ -129,11 +196,11 @@ export function mountUsageView(container, api, getT, opts = {}) {
         "div",
         { class: "pu-pills", role: "tablist" },
         tabs.map(([id, label]) =>
-          h("button", { type: "button", role: "tab", class: tab === id ? "is-on" : "", "aria-selected": tab === id ? "true" : "false", onClick: () => { tab = id; render(); } }, label),
+          h("button", { type: "button", role: "tab", class: tab === id ? "is-on" : "", "aria-selected": tab === id ? "true" : "false", onClick: () => { tab = id; if (id === "quota") loadQuota(); else render(); } }, label),
         ),
       ),
       h("span", { class: "pu-spacer" }),
-      h("button", { type: "button", class: `pu-icon${loading ? " is-spin" : ""}`, title: t("refresh"), "aria-label": t("refresh"), onClick: () => load(true) }, "↻"),
+      h("button", { type: "button", class: `pu-icon${loading || quotaLoading ? " is-spin" : ""}`, title: t("refresh"), "aria-label": t("refresh"), onClick: () => { load(true); if (tab === "quota") loadQuota(true); } }, "↻"),
       opts.onClose ? h("button", { type: "button", class: "pu-close", title: t("homeStatsHide"), "aria-label": t("homeStatsHide"), onClick: () => opts.onClose() }, "×") : null,
       tab === "quota"
         ? null
@@ -270,8 +337,23 @@ export function mountUsageView(container, api, getT, opts = {}) {
     );
   }
 
+  function logTerminal() {
+    const log = source.id === "logs" && data?.source === "logs" ? data : null;
+    if (!log) return null;
+    if (log.status?.state === "error") return `${t("usageError")} ${log.status.error ?? ""}`;
+    if (log.ready === false && log.status?.state === "ready" && log.status?.total === 0) return t("usageNoLogs");
+    return null;
+  }
+
   function quota() {
-    const q = data.quota;
+    const q = quotaData;
+    const terminal = logTerminal();
+    if (terminal && !q?.limits?.length) {
+      return h("div", { class: "pu-body" }, h("p", { class: "pu-empty" }, terminal));
+    }
+    if (!q) {
+      return h("div", { class: "pu-body" }, h("p", { class: "pu-empty" }, quotaError ? t("quotaError") : t("usageLoading")));
+    }
     if (!q.limits.length) {
       const msg = q.kind === "accounts" ? (q.error ? t("quotaError") : t("noQuotaAccounts")) : t("noQuota");
       return h("div", { class: "pu-body" }, h("p", { class: "pu-empty" }, msg));
@@ -299,12 +381,21 @@ export function mountUsageView(container, api, getT, opts = {}) {
   }
 
   // ---- status --------------------------------------------------------------------
+  function errorStatus(e) {
+    const msg = String(e?.message ?? e);
+    const text = e?.status === 401 || e?.status === 403 ? t("usageAuth") : /backend/iu.test(msg) ? t("usageNoBackend") : `${t("usageError")} ${msg}`;
+    return h("p", { class: "pu-status is-error" }, text);
+  }
+
   function statusLine() {
-    if (error) {
-      const msg = String(error?.message ?? error);
-      const text = error?.status === 401 || error?.status === 403 ? t("usageAuth") : /backend/iu.test(msg) ? t("usageNoBackend") : `${t("usageError")} ${msg}`;
-      return h("p", { class: "pu-status is-error" }, text);
+    if (tab === "quota") {
+      if (quotaError) return errorStatus(quotaError);
+      const terminal = logTerminal();
+      if (terminal) return h("p", { class: `pu-status${data?.status?.state === "error" ? " is-error" : ""}` }, terminal);
+      const sourceId = source.id === "logs" ? "logs" : "codexhost";
+      return h("p", { class: "pu-status" }, quotaData ? (sourceId === "codexhost" ? t("sourceHost") : t("sourceLogs")) : t("usageLoading"));
     }
+    if (error) return errorStatus(error);
     if (!data) return h("p", { class: "pu-status" }, t("usageLoading"));
     const parts = [data.source === "codexhost" ? t("sourceHost") : t("sourceLogs")];
     const r = data.reading;
@@ -324,10 +415,11 @@ export function mountUsageView(container, api, getT, opts = {}) {
   function render() {
     if (disposed) return;
     let body;
-    if (data?.ready) {
+    if (tab === "quota") {
+      body = quota();
+    } else if (data?.ready) {
       if (tab === "harness" && !data.harnessRows) tab = "overview";
-      body =
-        tab === "overview" ? overview() : tab === "models" ? table(data.models, t("model")) : tab === "harness" ? table(data.harnessRows, t("harness")) : quota();
+      body = tab === "overview" ? overview() : tab === "models" ? table(data.models, t("model")) : table(data.harnessRows, t("harness"));
     } else if (data && !data.ready && data.status?.state === "ready" && data.status?.total === 0) {
       body = h("div", { class: "pu-body" }, h("p", { class: "pu-empty" }, t("usageNoLogs")));
     } else {
