@@ -65,6 +65,12 @@
   font-size: 12.5px;
 }
 
+/* Long model/harness tables scroll inside the home panel, not the hero. */
+.pu--home .pu-models {
+  max-height: min(45vh, 360px);
+  overflow-y: auto;
+}
+
 .pu-close {
   display: grid;
   place-items: center;
